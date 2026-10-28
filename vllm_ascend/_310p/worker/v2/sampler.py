@@ -37,11 +37,11 @@ def _apply_temperature_pytorch(
     """In-place temperature scaling (Triton-free; skips temp in {0, 1})."""
     temps = temperature[expanded_idx_mapping].to(dtype=torch.float32)
     need_scale = (temps != 0.0) & (temps != 1.0)
-    if not bool(need_scale.any().item()):
-        return
-    # Work in FP32 for numerical stability, write back to logits dtype.
-    scaled = logits.to(torch.float32) / temps.unsqueeze(-1)
-    logits.copy_(torch.where(need_scale.unsqueeze(-1), scaled.to(logits.dtype), logits))
+    # Rows with temp in {0, 1} are scaled by 1.0 so the mask semantics are kept
+    # without a host round-trip or extra full-vocab temporaries. ``logits`` is
+    # FP32 at every call site, so the in-place division is exact.
+    scale = torch.where(need_scale, temps, torch.ones_like(temps))
+    logits.div_(scale.unsqueeze(-1))
 
 
 class Ascend310PSampler:

@@ -204,6 +204,24 @@ def _sample_from_probs_row_cpu(probs_row: torch.Tensor, generator: torch.Generat
     return int(torch.searchsorted(cdf, torch.tensor([u], dtype=torch.float32), right=True).item())
 
 
+_ROW_HOST_CACHE: dict[int, torch.Tensor] = {}
+
+
+def _probs_row_to_host(probs: torch.Tensor, logit_idx: int) -> torch.Tensor:
+    """Fetch one probability row to host, reusing a pinned buffer on NPU."""
+    row = probs[logit_idx].detach()
+    if row.device.type != "npu":
+        return row.to("cpu").clone()
+    vocab_size = probs.shape[-1]
+    buffer = _ROW_HOST_CACHE.get(vocab_size)
+    if buffer is None:
+        buffer = torch.empty(vocab_size, dtype=probs.dtype, pin_memory=True)
+        _ROW_HOST_CACHE[vocab_size] = buffer
+    buffer.copy_(row, non_blocking=True)
+    torch.npu.synchronize()
+    return buffer
+
+
 def probabilistic_rejection_sample_cpu(
     target_logits: torch.Tensor,
     draft_sampled_cpu: torch.Tensor,
@@ -239,6 +257,31 @@ def probabilistic_rejection_sample_cpu(
     sources = {int(req): gen for req, gen in source_generators.items()}
     prepared = _prepare_cpu_generators_310p(sources) if sources else {}
 
+    # Gather every p(draft) the decision loop needs in one D2H, so the loop
+    # below never issues a per-token device sync.
+    draft_col: dict[int, int] = {}
+    for batch_idx in range(num_reqs):
+        row_start = int(cu_np[batch_idx])
+        row_end = int(cu_np[batch_idx + 1])
+        if row_end <= row_start:
+            continue
+        if float(temperature_np[int(idx_mapping_np[batch_idx])]) < _SAMPLING_EPS:
+            continue
+        for logit_idx in range(row_start, row_end - 1):
+            draft_token = int(draft_cpu[logit_idx + 1])
+            if draft_token >= 0:
+                draft_col[logit_idx] = draft_token
+    p_draft_cpu: dict[int, float] = {}
+    if draft_col:
+        vocab_size = probs.shape[-1]
+        flat_indices = torch.as_tensor(
+            [row_idx * vocab_size + col_idx for row_idx, col_idx in draft_col.items()],
+            dtype=torch.int64,
+            device=probs.device,
+        )
+        gathered = probs.view(-1).index_select(0, flat_indices).detach().to("cpu")
+        p_draft_cpu = dict(zip(draft_col.keys(), gathered.tolist()))
+
     for batch_idx in range(num_reqs):
         start = int(cu_np[batch_idx])
         end = int(cu_np[batch_idx + 1])
@@ -268,25 +311,25 @@ def probabilistic_rejection_sample_cpu(
                 draft_token = int(draft_cpu[logit_idx + 1])
                 if draft_token < 0:
                     # Invalid pad draft → force recover/bonus path.
-                    row = probs[logit_idx].detach().cpu()
+                    row = _probs_row_to_host(probs, logit_idx)
                     sampled_cpu[batch_idx, accepted] = _sample_from_probs_row_cpu(row, gen)
                     accepted += 1
                     break
-                p_draft = float(probs[logit_idx, draft_token].item())
+                p_draft = p_draft_cpu[logit_idx]
                 u = _draw_uniform_cpu(gen)
                 if u < p_draft:
                     sampled_cpu[batch_idx, accepted] = draft_token
                     accepted += 1
                     continue
                 # Reject: sample recovered token from residual (zero draft mass).
-                row = probs[logit_idx].detach().cpu().clone()
+                row = _probs_row_to_host(probs, logit_idx)
                 row[draft_token] = 0.0
                 sampled_cpu[batch_idx, accepted] = _sample_from_probs_row_cpu(row, gen)
                 accepted += 1
                 break
 
             # Bonus token (all drafts accepted) or final logit.
-            row = probs[logit_idx].detach().cpu()
+            row = _probs_row_to_host(probs, logit_idx)
             sampled_cpu[batch_idx, accepted] = _sample_from_probs_row_cpu(row, gen)
             accepted += 1
             break
