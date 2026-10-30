@@ -193,6 +193,9 @@ def _draw_uniform_cpu(generator: torch.Generator | None) -> float:
     return float(u.clamp_min_(_UNIFORM_TINY).item())
 
 
+_CDF_HOST_CACHE: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def _sample_from_probs_row_cpu(probs_row: torch.Tensor, generator: torch.Generator | None) -> int:
     """Inverse-CDF sample one token from a 1-D probability row (CPU)."""
     row = probs_row.detach().to(dtype=torch.float32, device="cpu")
@@ -200,8 +203,16 @@ def _sample_from_probs_row_cpu(probs_row: torch.Tensor, generator: torch.Generat
     if total <= 0.0:
         return int(row.argmax().item())
     u = _draw_uniform_cpu(generator) * total
-    cdf = row.cumsum(dim=-1)
-    return int(torch.searchsorted(cdf, torch.tensor([u], dtype=torch.float32), right=True).item())
+    cached = _CDF_HOST_CACHE.get(row.numel())
+    if cached is None:
+        cdf = torch.empty_like(row)
+        probe = torch.empty(1, dtype=torch.float32)
+        _CDF_HOST_CACHE[row.numel()] = (cdf, probe)
+    else:
+        cdf, probe = cached
+    torch.cumsum(row, dim=-1, out=cdf)
+    probe[0] = u
+    return int(torch.searchsorted(cdf, probe, right=True).item())
 
 
 _ROW_HOST_CACHE: dict[int, torch.Tensor] = {}

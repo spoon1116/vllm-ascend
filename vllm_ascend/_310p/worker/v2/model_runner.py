@@ -1379,14 +1379,9 @@ class NPUModelRunner310V2(NPUModelRunner):
                 if sampled_tokens_cpu is None:
                     last_tokens = sampled_tokens.index_select(0, valid_batch)[:, 0]
                 else:
-                    last_tokens_cpu = torch.stack(
-                        [
-                            sampled_tokens_cpu[
-                                batch_idx,
-                                int(self._num_sampled_cpu[batch_idx]) - 1,
-                            ]
-                            for batch_idx in valid_batch_np
-                        ]
+                    # Numpy gather replaces R scalar tensor extractions + stack.
+                    last_tokens_cpu = torch.from_numpy(
+                        sampled_tokens_cpu.numpy()[valid_batch_np, self._num_sampled_cpu.numpy()[valid_batch_np] - 1]
                     ).to(torch.int64)
                     last_tokens = last_tokens_cpu.to(self.device, non_blocking=True)
             self.req_states.last_sampled_tokens.index_copy_(
