@@ -34,11 +34,13 @@ def _apply_temperature_pytorch(
     expanded_idx_mapping: torch.Tensor,
     temperature: torch.Tensor,
 ) -> None:
-    """In-place temperature scaling (Triton-free; skips temp in {0, 1})."""
+    """In-place temperature scaling (Triton-free; skips temp in {0, 1}).
+
+    The caller decides from the host mirror whether any row needs scaling, so
+    this never performs a device→host sync.
+    """
     temps = temperature[expanded_idx_mapping].to(dtype=torch.float32)
     need_scale = (temps != 0.0) & (temps != 1.0)
-    if not bool(need_scale.any().item()):
-        return
     # Work in FP32 for numerical stability, write back to logits dtype.
     scaled = logits.to(torch.float32) / temps.unsqueeze(-1)
     logits.copy_(torch.where(need_scale.unsqueeze(-1), scaled.to(logits.dtype), logits))
@@ -205,6 +207,11 @@ class Ascend310PSampler:
     def _any_random(self, idx_mapping_np: np.ndarray) -> bool:
         return bool(np.any(self._temperature_np[idx_mapping_np] >= _SAMPLING_EPS))
 
+    def _temperature_needs_scale(self, idx_mapping_np: np.ndarray) -> bool:
+        """Host-side replacement for the old ``need_scale.any().item()`` probe."""
+        temp = self._temperature_np[idx_mapping_np]
+        return bool(np.any((temp != 0.0) & (temp != 1.0)))
+
     def apply_sampling_params(
         self,
         logits: torch.Tensor,
@@ -220,11 +227,12 @@ class Ascend310PSampler:
         processed = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
         if not self._batch_needs_logits_processing(idx_mapping_np):
             return processed
-        _apply_temperature_pytorch(
-            processed,
-            expanded_idx_mapping,
-            self.sampling_states.temperature.gpu,
-        )
+        if self._temperature_needs_scale(idx_mapping_np):
+            _apply_temperature_pytorch(
+                processed,
+                expanded_idx_mapping,
+                self.sampling_states.temperature.gpu,
+            )
         do_top_k = np.any(self._top_k_np[idx_mapping_np] != max(self.vocab_size, 1))
         do_top_p = np.any(self._top_p_np[idx_mapping_np] != 1.0)
         top_k = self.sampling_states.top_k.gpu[expanded_idx_mapping] if do_top_k else None
@@ -271,11 +279,12 @@ class Ascend310PSampler:
         processed = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
 
         if self._batch_needs_logits_processing(idx_mapping_np):
-            _apply_temperature_pytorch(
-                processed,
-                expanded_idx_mapping,
-                self.sampling_states.temperature.gpu,
-            )
+            if self._temperature_needs_scale(idx_mapping_np):
+                _apply_temperature_pytorch(
+                    processed,
+                    expanded_idx_mapping,
+                    self.sampling_states.temperature.gpu,
+                )
             do_top_k = np.any(self._top_k_np[idx_mapping_np] != max(self.vocab_size, 1))
             do_top_p = np.any(self._top_p_np[idx_mapping_np] != 1.0)
             top_k = self.sampling_states.top_k.gpu[expanded_idx_mapping] if do_top_k else None
@@ -288,7 +297,10 @@ class Ascend310PSampler:
             # Greedy rows keep argmax; random rows use MRV1 inverse-CDF sampling.
             greedy = processed.argmax(dim=-1)
             probs = processed.softmax(dim=-1, dtype=torch.float32)
-            expanded_np = expanded_idx_mapping.detach().to("cpu").numpy()
+            # Reuse the host mirror built in prepare_inputs: no D2H here.
+            expanded_np = getattr(input_batch, "expanded_idx_mapping_np", None)
+            if expanded_np is None:
+                expanded_np = expanded_idx_mapping.detach().to("cpu").numpy()
             generators = self._build_row_generators(expanded_np)
             random_sampled = _random_sample_310p(probs, generators)
             is_random = self.sampling_states.temperature.gpu[expanded_idx_mapping] >= _SAMPLING_EPS

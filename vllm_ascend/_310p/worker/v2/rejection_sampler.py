@@ -85,16 +85,17 @@ class RejectionSampler310V2(RejectionSampler):
 
         any_random = bool(np.any(temperature_np[idx_mapping_np] >= _SAMPLING_EPS))
         if any_random:
-            assert input_batch.input_ids_cpu is not None
-            assert input_batch.logits_indices_np is not None
-            draft_sampled_cpu = input_batch.input_ids_cpu[torch.from_numpy(input_batch.logits_indices_np)]
+            # ``input_ids`` is the only mirror of the draft tokens (the host
+            # input buffer no longer carries them); gather on device and let
+            # the probabilistic path pull it to CPU once it has synchronized.
+            draft_sampled = input_batch.input_ids[input_batch.logits_indices]
             source_generators = getattr(self.sampler, "_source_generators", {})
             # Persistent InputBatch arrays; slice to this step's request count.
             cu_num_logits_np = input_batch.cu_num_logits_np[: num_reqs + 1]
             idx_np = idx_mapping_np[:num_reqs]
             sampled, _, sampled_cpu, num_sampled_cpu = probabilistic_rejection_sample_cpu(
                 processed,
-                draft_sampled_cpu,
+                draft_sampled,
                 cu_num_logits_np,
                 self.num_speculative_steps,
                 temperature_np,

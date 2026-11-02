@@ -521,6 +521,12 @@ def test_postprocess_sampled_keeps_last_token_on_device() -> None:
             num_rejected,
             query_start_loc,
         )
+        # Request-state accounting is deferred to the next execute_model.
+        post_update.assert_not_called()
+        runner.model_state.postprocess_state.assert_not_called()
+        torch.testing.assert_close(runner.req_states.last_sampled_tokens, runner.req_states.last_sampled_tokens_cpu)
+
+        runner._flush_deferred_post_state()
 
     post_update.assert_called_once()
     runner.model_state.postprocess_state.assert_called_once()

@@ -136,6 +136,10 @@ class NPUModelRunner310V2(NPUModelRunner):
         make_buffer = self._make_metadata_buffer
         self._decode_req_indices = make_buffer(self.max_num_reqs, torch.int64, pin_memory)
         self._decode_input_indices = make_buffer(self.max_num_reqs, torch.int64, pin_memory)
+        # Draft-token scatter indices. Keeps draft tokens on NPU instead of
+        # round-tripping them through the host input buffer every step.
+        self._draft_dst_indices = make_buffer(self.max_num_tokens, torch.int64, pin_memory)
+        self._draft_src_indices = make_buffer(self.max_num_tokens, torch.int64, pin_memory)
         self._idx_mapping = make_buffer(self.max_num_reqs, torch.int32, pin_memory)
         self._cu_num_logits = make_buffer(self.max_num_reqs + 1, torch.int32, pin_memory)
         self._expanded_idx_mapping = make_buffer(self.max_num_tokens, torch.int32, pin_memory)
@@ -148,6 +152,9 @@ class NPUModelRunner310V2(NPUModelRunner):
         self._force_eager_pc_batch = False
         self._force_eager_spec_batch = False
         self._spec_dummy_capture = False
+        # Request bookkeeping deferred from the previous sampling step; replayed
+        # at the top of the next execute_model (see _flush_deferred_post_state).
+        self._deferred_post_state = None
         # Populated in initialize_kv_cache; also set here so UT can call
         # ``_allocate_kv_cache_tensors`` without going through that path.
         self._attn_kv_copy_params: list[tuple[torch.Tensor, torch.Tensor, int]] = []
@@ -277,6 +284,7 @@ class NPUModelRunner310V2(NPUModelRunner):
             cu_num_logits = self._cu_num_logits.gpu[: num_reqs + 1]
             self._cu_num_logits.copy_to_gpu(num_reqs + 1)
             expanded_idx_mapping = idx_mapping
+            expanded_idx_mapping_np = idx_mapping_np
             self._expanded_local_pos.np[:num_reqs].fill(0)
             expanded_local_pos = self._expanded_local_pos.gpu[:num_reqs]
             self._expanded_local_pos.copy_to_gpu(num_reqs)
@@ -303,6 +311,7 @@ class NPUModelRunner310V2(NPUModelRunner):
                 self._expanded_local_pos.np,
             )
             expanded_idx_mapping = self._expanded_idx_mapping.gpu[:total_num_logits]
+            expanded_idx_mapping_np = self._expanded_idx_mapping.np[:total_num_logits]
             expanded_local_pos = self._expanded_local_pos.gpu[:total_num_logits]
             self._expanded_idx_mapping.copy_to_gpu(total_num_logits)
             self._expanded_local_pos.copy_to_gpu(total_num_logits)
@@ -345,6 +354,7 @@ class NPUModelRunner310V2(NPUModelRunner):
             prefill_len_np,
             draft_tokens_map,
             req_ids,
+            num_tokens,
             num_tokens_after_padding,
         )
 
@@ -387,6 +397,7 @@ class NPUModelRunner310V2(NPUModelRunner):
             idx_mapping=idx_mapping,
             idx_mapping_np=idx_mapping_np,
             expanded_idx_mapping=expanded_idx_mapping,
+            expanded_idx_mapping_np=expanded_idx_mapping_np,
             expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,
             num_tokens=num_tokens,
@@ -640,6 +651,9 @@ class NPUModelRunner310V2(NPUModelRunner):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ):
+        # Replay the previous step's request bookkeeping before any request
+        # slot can be freed or reused.
+        self._flush_deferred_post_state()
         self._force_eager_pc_batch = False
         self._force_eager_spec_batch = False
         if not dummy_run:
@@ -1113,23 +1127,23 @@ class NPUModelRunner310V2(NPUModelRunner):
         prefill_len_np: np.ndarray,
         draft_tokens_map: dict[str, list[int]] | None,
         req_ids: list[str],
+        num_tokens: int,
         num_tokens_after_padding: int,
     ) -> None:
-        """Build host-owned inputs, then patch decode tokens from NPU state."""
+        """Build host-owned inputs, then patch decode/draft tokens from NPU.
+
+        Draft tokens are gathered from ``req_states.draft_tokens`` on device and
+        scattered into ``input_ids`` there, so MTP steps no longer round-trip the
+        whole token buffer through the host.
+        """
         draft_tokens_map = draft_tokens_map or {}
-        active_draft_tokens_cpu = None
-        if draft_tokens_map:
-            # Gather real drafts; scheduler values may be placeholders.
-            active_draft_tokens_cpu = (
-                self.req_states.draft_tokens.index_select(0, idx_mapping.to(torch.int64))
-                .to(dtype=self.input_ids_cpu.dtype)
-                .cpu()
-            )
+        num_draft_slots = int(self.req_states.draft_tokens.shape[1])
         self.input_ids_cpu[:num_tokens_after_padding].zero_()
         self.next_prefill_tokens_cpu.zero_()
         decode_req_indices: list[int] = []
         decode_input_indices: list[int] = []
-        needs_host_copy = False
+        draft_dst_indices: list[int] = []
+        draft_src_indices: list[int] = []
         has_prefill = False
         for batch_idx, req_idx_value in enumerate(idx_mapping_np):
             req_idx = int(req_idx_value)
@@ -1138,7 +1152,6 @@ class NPUModelRunner310V2(NPUModelRunner):
             num_computed = int(self.req_states.num_computed_tokens_np[req_idx])
             prefill_len = int(prefill_len_np[batch_idx])
             if num_computed < prefill_len:
-                needs_host_copy = True
                 has_prefill = True
                 self.input_ids_cpu[start:end].copy_(
                     self.req_states.all_token_ids.cpu[req_idx, num_computed : num_computed + end - start]
@@ -1152,22 +1165,22 @@ class NPUModelRunner310V2(NPUModelRunner):
                 decode_req_indices.append(req_idx)
                 decode_input_indices.append(start)
             drafts = draft_tokens_map.get(req_ids[batch_idx], ())
-            if drafts:
-                assert active_draft_tokens_cpu is not None
-                needs_host_copy = True
-                draft_count = min(len(drafts), end - start - 1)
-                self.input_ids_cpu[start + 1 : start + 1 + draft_count].copy_(
-                    active_draft_tokens_cpu[batch_idx, :draft_count]
-                )
+            if drafts and num_draft_slots:
+                # Scheduler entries may be placeholders; scatter the real
+                # drafts that propose() wrote into req_states.draft_tokens.
+                for offset in range(min(len(drafts), end - start - 1)):
+                    draft_dst_indices.append(start + 1 + offset)
+                    draft_src_indices.append(req_idx * num_draft_slots + offset)
 
-        if needs_host_copy:
+        if has_prefill:
             self.input_buffers.input_ids[:num_tokens_after_padding].copy_(
                 self.input_ids_cpu[:num_tokens_after_padding], non_blocking=True
             )
         if decode_req_indices:
             num_decode_reqs = len(decode_req_indices)
             pure_decode = (
-                not needs_host_copy
+                not has_prefill
+                and not draft_dst_indices
                 and num_decode_reqs == idx_mapping_np.size
                 and np.all(np.diff(query_start_loc_np[: num_decode_reqs + 1]) == 1)
             )
@@ -1195,6 +1208,24 @@ class NPUModelRunner310V2(NPUModelRunner):
                 0,
                 input_indices,
                 decode_tokens.to(self.input_buffers.input_ids.dtype),
+            )
+        if not has_prefill:
+            # Only the per-request query rows were written on device; the
+            # padding tail still needs clearing for FULL graph replay.
+            self.input_buffers.input_ids[num_tokens:num_tokens_after_padding].zero_()
+        if draft_dst_indices:
+            num_drafts = len(draft_dst_indices)
+            self._draft_dst_indices.np[:num_drafts] = draft_dst_indices
+            self._draft_src_indices.np[:num_drafts] = draft_src_indices
+            dst_indices = self._draft_dst_indices.gpu[:num_drafts]
+            src_indices = self._draft_src_indices.gpu[:num_drafts]
+            self._draft_dst_indices.copy_to_gpu(num_drafts)
+            self._draft_src_indices.copy_to_gpu(num_drafts)
+            draft_values = self.req_states.draft_tokens.view(-1).index_select(0, src_indices)
+            self.input_buffers.input_ids.index_copy_(
+                0,
+                dst_indices,
+                draft_values.to(self.input_buffers.input_ids.dtype),
             )
         if has_prefill:
             self.req_states.next_prefill_tokens.copy_(self.next_prefill_tokens_cpu, non_blocking=True)
@@ -1341,7 +1372,13 @@ class NPUModelRunner310V2(NPUModelRunner):
         num_rejected: torch.Tensor,
         query_start_loc: torch.Tensor | None = None,
     ) -> None:
-        """Run request bookkeeping on CPU; upload only immediate NPU consumers."""
+        """Publish drafter-visible state now; defer the remaining bookkeeping.
+
+        ``propose`` (the draft graph) only needs the host mirrors published
+        below. Request-state accounting is replayed at the top of the next
+        ``execute_model`` so it overlaps with the draft graph instead of
+        delaying it.
+        """
         # Device arguments remain for upstream API compatibility.
         del num_sampled, num_rejected, query_start_loc
         if self._sampled_tokens_cpu is not None:
@@ -1352,15 +1389,6 @@ class NPUModelRunner310V2(NPUModelRunner):
         if self.speculator is not None and self._num_rejected_cpu is not None:
             self.speculator._last_num_rejected_cpu = self._num_rejected_cpu
         sampled_tokens_cpu = self._sampled_tokens_cpu
-        num_sampled_cpu = _post_update_cpu(
-            self._postprocess_idx_mapping_np,
-            self._postprocess_query_start_loc_np,
-            self.req_states,
-            sampled_tokens if sampled_tokens_cpu is None else sampled_tokens_cpu,
-            self._num_sampled_cpu,
-            self._num_rejected_cpu,
-            update_tokens=sampled_tokens_cpu is not None,
-        )
         # Chunked-prefill rows have no sample and retain prior state.
         valid_batch_np = np.flatnonzero(self._num_sampled_cpu.numpy() > 0)
         if valid_batch_np.size:
@@ -1394,11 +1422,6 @@ class NPUModelRunner310V2(NPUModelRunner):
                 valid_reqs,
                 last_tokens.to(self.req_states.last_sampled_tokens.dtype).view(-1, 1),
             )
-        self.model_state.postprocess_state(
-            torch.from_numpy(self._postprocess_idx_mapping_np),
-            num_sampled_cpu,
-            self.req_states.num_computed_tokens_cpu,
-        )
         # Publish host mirrors for draft-prefill prepare (avoid 4× D2H there).
         if self.speculator is not None and self._num_rejected_cpu is not None:
             num_reqs = int(self._num_rejected_cpu.shape[0])
@@ -1424,6 +1447,40 @@ class NPUModelRunner310V2(NPUModelRunner):
                 last_sampled_np=last_sampled_np,
                 next_prefill_np=next_prefill_np,
             )
+        # Snapshot sampler-owned CPU buffers before the next step reuses them.
+        self._deferred_post_state = (
+            self._postprocess_idx_mapping_np.copy(),
+            self._postprocess_query_start_loc_np.copy(),
+            None if sampled_tokens_cpu is None else sampled_tokens_cpu.clone(),
+            self._num_sampled_cpu.clone(),
+            self._num_rejected_cpu.clone(),
+        )
+
+    def _flush_deferred_post_state(self) -> None:
+        """Apply the request bookkeeping deferred by the previous step.
+
+        Must run before ``finish_requests``/``add_requests`` so a freed slot is
+        not reused with stale ``all_token_ids``/``num_computed_tokens``.
+        """
+        state = self._deferred_post_state
+        if state is None:
+            return
+        self._deferred_post_state = None
+        idx_mapping_np, query_start_loc_np, sampled_tokens_cpu, num_sampled_cpu, num_rejected_cpu = state
+        _post_update_cpu(
+            idx_mapping_np,
+            query_start_loc_np,
+            self.req_states,
+            sampled_tokens_cpu,
+            num_sampled_cpu,
+            num_rejected_cpu,
+            update_tokens=sampled_tokens_cpu is not None,
+        )
+        self.model_state.postprocess_state(
+            torch.from_numpy(idx_mapping_np),
+            num_sampled_cpu,
+            self.req_states.num_computed_tokens_cpu,
+        )
 
     def _update_seq_lens_cpu(
         self,

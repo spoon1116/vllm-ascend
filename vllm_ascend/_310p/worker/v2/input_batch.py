@@ -16,3 +16,5 @@ class Ascend310PInputBatch(AscendInputBatch):
     block_tables_np: tuple[np.ndarray, ...] | None = None
     input_ids_cpu: torch.Tensor | None = None
     logits_indices_np: np.ndarray | None = None
+    # Host mirror of ``expanded_idx_mapping`` so sampling never needs a D2H.
+    expanded_idx_mapping_np: np.ndarray | None = None
