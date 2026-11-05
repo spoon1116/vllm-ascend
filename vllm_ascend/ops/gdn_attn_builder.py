@@ -202,10 +202,14 @@ def _materialize_graph_request_tensor(
         raise ValueError(f"actual_request_count ({actual_request_count}) exceeds source rows ({values.size(0)})")
 
     materialized = buffer[:graph_request_count]
-    materialized[:actual_request_count].copy_(
-        values[:actual_request_count],
-        non_blocking=True,
-    )
+    # Spec masks are updated in place, so their source is this buffer's own
+    # contiguous prefix; copying it onto itself is a wasted device op.
+    source_is_self = values.is_contiguous() and values.data_ptr() == buffer.data_ptr()
+    if not source_is_self:
+        materialized[:actual_request_count].copy_(
+            values[:actual_request_count],
+            non_blocking=True,
+        )
     materialized[actual_request_count:].fill_(padding_value)
     return materialized
 
@@ -811,10 +815,16 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         if spec_sequence_masks is not None:
             assert spec_sequence_masks_cpu is not None
             spec_sequence_masks.copy_(spec_sequence_masks_cpu, non_blocking=True)
-            spec_sequence_indices, non_spec_sequence_indices = self._copy_sequence_indices_to_device(
-                spec_sequence_masks_cpu,
-                num_spec_decodes,
-            )
+            if num_spec_decodes == m.num_reqs:
+                # Every row is a spec decode, so the partition is the identity:
+                # slicing replaces the index H2D copy and the per-step gather.
+                spec_sequence_indices = None
+                non_spec_sequence_indices = None
+            else:
+                spec_sequence_indices, non_spec_sequence_indices = self._copy_sequence_indices_to_device(
+                    spec_sequence_masks_cpu,
+                    num_spec_decodes,
+                )
 
         if spec_sequence_masks is None:
             spec_token_indx = None
@@ -828,8 +838,9 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
         else:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
             assert spec_sequence_masks_cpu is not None
-            assert spec_sequence_indices is not None
-            assert non_spec_sequence_indices is not None
+            identity_partition = spec_sequence_indices is None
+            assert identity_partition or spec_sequence_indices is not None
+            assert identity_partition or non_spec_sequence_indices is not None
 
             if num_prefills == 0 and num_decodes == 0:
                 spec_token_size = min(
@@ -846,10 +857,11 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                     dtype=torch.int32,
                     device=query_start_loc.device,
                 )
-                spec_state_indices_tensor = torch.index_select(
-                    block_table_tensor[:, : self.num_spec + 1],
-                    0,
-                    spec_sequence_indices,
+                spec_block_table = block_table_tensor[:, : self.num_spec + 1]
+                spec_state_indices_tensor = (
+                    spec_block_table
+                    if identity_partition
+                    else torch.index_select(spec_block_table, 0, spec_sequence_indices)
                 )
                 non_spec_state_indices_tensor = None
                 spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
@@ -910,11 +922,12 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 )
 
             assert num_accepted_tokens is not None
-            num_accepted_tokens = torch.index_select(
-                num_accepted_tokens,
-                0,
-                spec_sequence_indices,
-            )
+            if not identity_partition:
+                num_accepted_tokens = torch.index_select(
+                    num_accepted_tokens,
+                    0,
+                    spec_sequence_indices,
+                )
 
         # A FULL graph retains captured speculative conv/recurrent tasks. Clear
         # their stable inputs on every no-spec replay so an idle or prefill
